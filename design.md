@@ -163,3 +163,202 @@
   - オブジェクト自体は残したまま「削除マーカー」を追加することで、過去バージョンにロールバック可能。  
   - WORM（Write Once Read Many）やコンプライアンス要件にも対応できる。  
 
+
+## 全体アーキテクチャ
+
+```mermaid
+graph LR
+  A[Client SDK or CLI] -->|S3 REST SigV4| G
+
+  subgraph Gateway_API
+    G1[AuthN AuthZ]
+    G2[Routing]
+    G3[PUT GET Multipart]
+  end
+
+  G[Gateway API] --> CP
+
+  subgraph Control_Plane
+    R1[Raft Leader]
+    R2[Raft Follower]
+    KV[Embedded KV Store]
+    R1 --> R2
+    R1 --> KV
+  end
+
+  subgraph Data_Plane
+    D1[Data Node 1]
+    D2[Data Node 2]
+    D3[Data Node 3]
+  end
+
+  CP[Control Plane] --> D1
+  CP --> D2
+  CP --> D3
+```
+
+## PUTのライフサイクル
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant GW as Gateway
+  participant CP as Control Plane
+  participant D1 as Data Node 1
+  participant D2 as Data Node 2
+  participant D3 as Data Node 3
+
+  C->>GW: PUT object
+  GW->>CP: placement lookup
+  CP-->>GW: D1 D2 D3
+
+  par write quorum
+    GW->>D1: write
+    D1-->>GW: ack
+    GW->>D2: write
+    D2-->>GW: ack
+    GW->>D3: write
+    D3-->>GW: ack optional
+  end
+
+  GW->>CP: commit metadata
+  CP-->>GW: commit ok
+  GW-->>C: 200 OK
+```
+
+## マルチパートアップロード
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant GW as Gateway
+  participant CP as Control Plane
+  participant DN as Data Nodes
+
+  C->>GW: create multipart upload
+  GW->>CP: mpu create
+  CP-->>GW: upload id
+  GW-->>C: upload id
+
+  loop for each part
+    C->>GW: upload part N
+    GW->>CP: placement for part N
+    CP-->>GW: target nodes
+    GW->>DN: write part N parallel
+    DN-->>GW: ack
+    GW->>CP: update mpu progress
+    CP-->>GW: ok
+  end
+
+  C->>GW: complete multipart upload
+  GW->>CP: commit object metadata
+  CP-->>GW: commit ok
+  GW-->>C: 200 OK
+
+```
+
+## GETとRange GET
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant GW as Gateway
+  participant CP as Control Plane
+  participant D1 as Data Node 1
+  participant D2 as Data Node 2
+  participant D3 as Data Node 3
+
+  C->>GW: GET object with ranges
+  GW->>CP: resolve placement
+  CP-->>GW: D1 D2 D3
+
+  par parallel ranges
+    GW->>D1: GET bytes 0..4MB
+    D1-->>GW: data chunk
+    GW->>D2: GET bytes 4MB..8MB
+    D2-->>GW: data chunk
+    GW->>D3: GET bytes 8MB..12MB
+    D3-->>GW: data chunk
+  end
+
+  GW-->>C: merge chunks and stream
+
+
+```
+
+##  データ配置とEC
+```mermaid
+graph LR
+  K1[object key K1] --> CH
+  K2[object key K2] --> CH
+  CH[Consistent Hashing] --> N1
+  CH --> N2
+  CH --> N3
+
+  subgraph Nodes
+    N1[Node A]
+    N2[Node B]
+    N3[Node C]
+  end
+
+  subgraph EC_k_plus_m
+    D1[Data shard d1]
+    D2[Data shard d2]
+    D3[Data shard d3]
+    D4[Data shard d4]
+    P1[Parity p1]
+    P2[Parity p2]
+  end
+
+  N1 -. store .-> D1
+  N2 -. store .-> D2
+  N3 -. store .-> D3
+  N1 -. store .-> D4
+  N2 -. store .-> P1
+  N3 -. store .-> P2
+
+```
+
+## メタデータとスケールアウト
+```mermaid
+graph TB
+  GW[Gateway API] --> PD
+
+  subgraph Placement_Driver
+    MAP[Key range to group]
+  end
+  PD[Placement Driver] --> MAP
+
+  subgraph Raft_Group_1
+    L1[Leader G1]
+    F1[Follower]
+    S1[KV Store 1]
+    L1 --> F1
+    L1 --> S1
+  end
+
+  subgraph Raft_Group_2
+    L2[Leader G2]
+    F2[Follower]
+    S2[KV Store 2]
+    L2 --> F2
+    L2 --> S2
+  end
+
+  MAP --> Raft_Group_1
+  MAP --> Raft_Group_2
+
+
+```
+
+## Healingの状態推移
+```mermaid
+stateDiagram-v2
+  [*] --> Healthy
+  Healthy --> Degraded: fragment missing
+  Degraded --> Healing: repair start
+  Healing --> Healthy: redundancy restored
+  Healing --> Degraded: retry needed
+
+
+
+
+```
